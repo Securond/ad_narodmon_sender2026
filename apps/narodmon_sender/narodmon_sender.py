@@ -1,56 +1,28 @@
-"""
-ENG
-AppDaemon narodmon.ru sender script
-Credits: @Lefey / https://github.com/Lefey/ad_narodmon_sender
-To enable this script add/edit parameters in /config/appdaemon/apps/narodmon_sender/config.yaml:
-narodmon-sender:
-  module: narodmon-sender
-  class: narodmon-sender
-  narodmon_device_mac: MAC-address to identify your device on narodmon.ru (mandatory)
-  narodmon_device_name: Name for your device (optional)
-  hass_coordinates_entity: Home assistant zone entity_id for getting latitude and longitude, helps auto placing device on map (optional)
-  hass_sensor_entities: Comma-separated home assistant sensor entity_id`s, without spaces. Support sensor and binary_sensor domains (mandatory)
-RU
-AppDaemon скрипт для отправки данных на narodmon.ru
-Автор: @Lefey / https://github.com/Lefey/ad_narodmon_sender
-Для работы скрипта в AppDaemon необходимо прописать параметры в /config/appdaemon/apps/narodmon_sender/config.yaml:
-narodmon-sender:
-  module: narodmon-sender
-  class: narodmon-sender
-  narodmon_device_mac: MAC-адрес идентифицирующий ваше устройство на narodmon.ru, 12-18 символов A-Z и 0-9 без разделителей или разделенных '-' или ':' (обязательный параметр)
-  narodmon_device_name: Имя вашего устройства (не обязательный параметр)
-  hass_coordinates_entity: Зона home assistant для получения координат, для автоматического размещения устройства на карте (не обязательный параметр)
-  hass_sensor_entities: Список cенсоров home assistant разделенный запятыми, без пробелов. Поддерживаются домены sensor и binary_sensor (обязательный параметр)
-
-Example config / Пример конфигурации:
-narodmon_sender:
-  module: narodmon_sender
-  class: narodmon_sender
-  narodmon_device_mac: AABBCCDDEEFF
-  narodmon_device_name: Xiaomi_WSDCGQ01LM
-  hass_coordinates_entity: zone.home
-  hass_sensor_entities: sensor.outside_temperature,sensor.outside_humidity,binary_sensor.door
-"""
 import appdaemon.plugins.hass.hassapi as hass
 import socket
 import datetime
 import collections
-import pytz
+
 
 class narodmon_sender(hass.Hass):
-    #метод запускаемый однократно при старте программы
+
     def initialize(self):
-        # объявляем переменные:
-        # список сенсоров для отправки
+        self.log("Narodmon PRO sender starting...")
+
         self.sensors = []
-        # словарь имен для сенсоров (берем из friendly_name)
         self.sensors_name = {}
-        # словарь типов сенсоров (берем из device_class, если есть)
         self.sensors_type = {}
-        # форматированные данные для отправки
         self.device_data = None
-        # словарь замены типов для автоопределения типа сенсора на narodmon.ru, 
-        # исходные данные берутся из параметра device_class сенсора, при отсутстви датчики будут именованы как SENSOR#, тип нужно вручную определить на сайте.
+
+        self.last_values = {}
+        self.data_changed = False
+
+        self.last_send_time = None
+
+        # интервалы (в секундах)
+        self.send_interval_changed = int(self.args.get("send_interval_changed", 360))  # 6 мин
+        self.send_interval_force = int(self.args.get("send_interval_force", 1200))    # 20 мин
+
         replace = {
             'temperature': 'TEMP',
             'humidity': 'RH',
@@ -60,93 +32,156 @@ class narodmon_sender(hass.Hass):
             'illuminance': 'LIGHT',
             'signal_strength': 'RSSI',
             None: 'SENSOR'
-            }
-        # проверяем, есть ли переменная с MAC-адресом в параметрах скрипта
-        if 'narodmon_device_mac' in self.args:
-            if self.args['narodmon_device_mac'] != None:
-                # начинаем формировать данные для отправки
-                self.device_data = '#' + self.args['narodmon_device_mac']
-                # проверяем наличие названия устройства в параметрах скрипта, добавляем к MAC-адресу, если есть
-                if 'narodmon_device_name' in self.args:
-                    if self.args['narodmon_device_name'] != None:
-                        self.device_data += '#' + self.args['narodmon_device_name']
-                # проверяем наличие зоны в параметрах скрипта для определения координат
-                if 'hass_coordinates_entity' in self.args:
-                    if self.entity_exists(self.args['hass_coordinates_entity']):
-                        lat = self.get_state(self.args['hass_coordinates_entity'], 'latitude')
-                        lng = self.get_state(self.args['hass_coordinates_entity'], 'longitude')
-                        if lat != None and lng != None:
-                            self.device_data += '\n#LAT#' + str(lat) + '\n#LNG#' + str(lng)
-            else:
-                exit('Please, define narodmon_device_mac value in /config/appdaemon/apps/narodmon_sender/config.yaml')
-        else:
-            exit('Please, specify narodmon_device_mac variable in /config/appdaemon/apps/narodmon_sender/config.yaml')
-        # проверка наличия перечня сенсоров в парамерах скрипта
-        if 'hass_sensor_entities' in self.args:
-            for entity in self.split_device_list(self.args['hass_sensor_entities']):
-                # проверка существования объекта в home assistant
-                if self.entity_exists(entity):
-                    domain, sensor_id = self.split_entity(entity)
-                    # отфильтровываем все кроме сенсоров и бинарных сенсоров
-                    if domain == 'sensor' or domain == 'binary_sensor':
-                        # заполняем список сенсоров для отправки
-                        self.sensors.append(entity)
-                        # заполняем словари имен и типов
-                        self.sensors_name[entity] = self.get_state(entity, 'friendly_name')
-                        self.sensors_type[entity] = self.get_state(entity, 'device_class')
-            # на основе словаря типов переименовываем и нумеруем по порядку повторяющиеся
-            for entity in self.sensors_type:
-                if self.sensors_type[entity] in replace:
-                    self.sensors_type[entity] = replace[self.sensors_type[entity]]
-            count = collections.Counter(self.sensors_type.values())
-            for type in count:
-                if count[type] > 1:
-                    num = count[type]
-                    sel = 1
-                    for entity in self.sensors_type:
-                        if self.sensors_type[entity] == type:
-                            self.sensors_type[entity] = type + str(range(num + 1)[sel])
-                            sel = sel + 1
-        else:
-            exit('Please, specify hass_sensor_entities variable in /config/appdaemon/apps/narodmon_sender/config.yaml')
-        # вызвываем метод отправки данных каждые 5 минут, начиная с текушего времени 
-        self.run_every(self.send_data, datetime.datetime.now(pytz.utc) + datetime.timedelta(seconds=2), 360)
-    # метод для отправки данных
-    def send_data(self, kwargs):
-        binary_replace = {
-            'off': '0',
-            'on': '1'
-            }
-        sensors_data = '\n'
-        # проверяем, есть ли сформированные данные об устройстве
-        if self.device_data != None:
-            for entity in self.sensors:
-                # отбрасываем недоступные датчики
-                if self.get_state(entity) != 'unavailable':
-                    if self.get_state(entity) != 'unknown':
-                    # замена состояния бинарных датчиков (on на 1 и off на 0), narodmon.ru не принимает в текстовом виде.
-                        if self.get_state(entity) in binary_replace:
-                            sensor_state = binary_replace[self.get_state(entity)]
-                        else:
-                            sensor_state = self.get_state(entity)
-                        # формируем строку с данными всех рабочих сенсоров
-                        sensors_data += '#' + self.sensors_type[entity] + '#' + sensor_state + '#' + self.sensors_name[entity] + '\n'
-            # собираем пакет данных для отправки: информация об устройстве + данные сенсоров + символ окончания пакета данных
-            data = self.device_data + sensors_data + '##'
-            # вывод в лог информации которая будет отправлена
-            self.log('Data for send to narodmon.ru:\n' + str(data))
-            # создаем сокет для подключения к narodmon.ru
+        }
+
+        # --- MAC ---
+        mac = self.args.get("narodmon_device_mac")
+        if not mac:
+            self.error("No MAC address specified!")
+            return
+
+        self.device_data = f"#{mac}"
+
+        name = self.args.get("narodmon_device_name")
+        if name:
+            self.device_data += f"#{name}"
+
+        # --- COORD ---
+        coord_entity = self.args.get("hass_coordinates_entity")
+        if coord_entity and self.entity_exists(coord_entity):
+            lat = self.get_state(coord_entity, attribute="latitude")
+            lng = self.get_state(coord_entity, attribute="longitude")
+
+            if lat and lng:
+                self.device_data += f"\n#LAT#{lat}\n#LNG#{lng}"
+
+        # --- SENSORS ---
+        sensor_list = self.args.get("hass_sensor_entities")
+        if not sensor_list:
+            self.error("No sensors specified!")
+            return
+
+        for entity in sensor_list.split(","):
+            entity = entity.strip()
+
+            if not self.entity_exists(entity):
+                self.warning(f"Sensor not found: {entity}")
+                continue
+
+            domain, sensor_id = self.split_entity(entity)
+
+            if domain != "sensor":
+                continue
+
+            self.sensors.append(sensor_id)
+
+            self.sensors_name[sensor_id] = self.get_state(entity, attribute="friendly_name")
+            self.sensors_type[sensor_id] = self.get_state(entity, attribute="device_class")
+
+        # --- TYPE NORMALIZATION ---
+        for sid in self.sensors_type:
+            self.sensors_type[sid] = replace.get(self.sensors_type[sid], "SENSOR")
+
+        count = collections.Counter(self.sensors_type.values())
+        for t in count:
+            if count[t] > 1:
+                i = 1
+                for sid in self.sensors_type:
+                    if self.sensors_type[sid] == t:
+                        self.sensors_type[sid] = f"{t}{i}"
+                        i += 1
+
+        # старт через 30 сек
+        self.run_in(self.start, 30)
+
+
+    def start(self, kwargs):
+        self.log("Narodmon sender started")
+
+        # подписка на изменения
+        for sensor_id in self.sensors:
+            self.listen_state(self.on_change, f"sensor.{sensor_id}")
+
+        # основной цикл проверки (раз в минуту)
+        self.run_every(self.scheduler, self.datetime(), 60)
+
+
+    def is_valid(self, state):
+        return state not in [None, "unknown", "unavailable"]
+
+
+    def on_change(self, entity, attribute, old, new, kwargs):
+        if not self.is_valid(new):
+            return
+
+        sensor_id = entity.split(".")[1]
+
+        if self.last_values.get(sensor_id) != new:
+            self.last_values[sensor_id] = new
+            self.data_changed = True
+            self.log(f"Data changed: {entity} = {new}", level="DEBUG")
+
+
+    def scheduler(self, kwargs):
+        now = self.datetime()
+
+        # если ещё не было отправок
+        if self.last_send_time is None:
+            self.log("First send")
+            self.send_all()
+            return
+
+        delta = (now - self.last_send_time).total_seconds()
+
+        # --- если данные менялись ---
+        if self.data_changed and delta >= self.send_interval_changed:
+            self.log("Sending due to changes")
+            self.send_all()
+            return
+
+        # --- если давно не отправляли ---
+        if delta >= self.send_interval_force:
+            self.log("Force send (timeout)")
+            self.send_all(force=True)
+            return
+
+
+    def send_all(self, force=False):
+        sensors_data = "\n"
+        valid_count = 0
+
+        for sensor_id in self.sensors:
+            entity = f"sensor.{sensor_id}"
+            state = self.get_state(entity)
+
+            if not self.is_valid(state):
+                continue
+
+            sensors_data += f"#{self.sensors_type[sensor_id]}#{state}#{self.sensors_name[sensor_id]}\n"
+            valid_count += 1
+
+        if valid_count == 0:
+            self.log("No valid data to send", level="WARNING")
+            return
+
+        data = self.device_data + sensors_data + "##"
+
+        self.log("Sending data:\n" + data)
+
+        try:
             sock = socket.socket()
-            try:
-                # пробуем подключиться
-                sock.connect(('narodmon.ru', 8283))
-                # пишем в сокет значения датчиков
-                sock.send(data.encode('utf-8'))
-                # читаем ответ сервера
-                reply = str(sock.recv(1024))
-                sock.close()
-                self.log('Server reply: ' + reply.strip("bn\'\\"))
-            except socket.error as err:
-                self.error('Got error when connecting to narodmon.ru: ' + str(err))
-        else:
-            exit('No device data for send to narodmon.ru')
+            sock.settimeout(10)
+
+            sock.connect(("narodmon.ru", 8283))
+            sock.send(data.encode("utf-8"))
+
+            reply = sock.recv(1024).decode("utf-8", errors="ignore")
+            sock.close()
+
+            self.last_send_time = self.datetime()
+            self.data_changed = False
+
+            self.log(f"Server reply: {reply.strip()}")
+
+        except socket.error as err:
+            self.error(f"Connection error: {err}")
